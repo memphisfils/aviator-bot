@@ -52,11 +52,36 @@ async function verifyHmac(c: any, rawBody: string) {
   return hex === sig
 }
 
+// Helper: simple D1 rate limit (per-IP per-minute)
+async function checkRateLimit(c: any, limitPerMin = 120) {
+  try {
+    const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown'
+    const now = Date.now()
+    const windowStart = Math.floor(now / 60000) * 60000
+    const key = `ingest:${ip}:${windowStart}`
+    const row = await c.env.DB.prepare('SELECT key, count FROM rate_limits WHERE key=?').bind(key).first<{ key: string; count: number }>()
+    if (row && row.count >= limitPerMin) return false
+    if (row) {
+      await c.env.DB.prepare('UPDATE rate_limits SET count=count+1 WHERE key=?').bind(key).run()
+    } else {
+      await c.env.DB.prepare('INSERT INTO rate_limits (key, count, window_start) VALUES (?, 1, ?)').bind(key, windowStart).run()
+    }
+    return true
+  } catch {
+    // fail open to avoid blocking
+    return true
+  }
+}
+
 // POST /api/signals (ingestion)
 app.post('/api/signals', async (c) => {
   const raw = await c.req.text()
   const ok = await verifyHmac(c, raw)
   if (!ok) return c.json({ error: 'invalid_signature' }, 401)
+
+  const allowed = await checkRateLimit(c, 240)
+  if (!allowed) return c.json({ error: 'rate_limited' }, 429)
+
   const body = JSON.parse(raw)
   const missing = requiredFields(body, [
     'id','platform','round_id','timestamp','predicted_class','confidence','model_version','recommended_action','created_at'
@@ -87,7 +112,58 @@ app.post('/api/signals', async (c) => {
     body.created_at
   ).run()
 
+  // Optional auto-alert based on confidence threshold
+  const minConf = Number((c.env as any).ALERT_MIN_CONFIDENCE ?? '0')
+  if (!Number.isNaN(minConf) && body.confidence >= minConf) {
+    const text = `Aviator Signal\nPlatform: ${body.platform}\nRound: ${body.round_id}\nClass: ${body.predicted_class}\nConfidence: ${Math.round(body.confidence*100)}%\nAction: ${body.recommended_action}`
+    // Store alert row first
+    const alertId = body.id + ':tg'
+    await c.env.DB.prepare('INSERT OR IGNORE INTO alerts (id, signal_id, channel, payload, status, retries) VALUES (?, ?, ?, ?, ?, 0)')
+      .bind(alertId, body.id, 'telegram', jsonStr({ text }), 'queued').run()
+    // Try Telegram
+    if (c.env.TELEGRAM_BOT_TOKEN && c.env.TELEGRAM_CHAT_ID) {
+      try {
+        const tgUrl = `https://api.telegram.org/bot${c.env.TELEGRAM_BOT_TOKEN}/sendMessage`
+        const tgRes = await fetch(tgUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: c.env.TELEGRAM_CHAT_ID, text }) })
+        if (tgRes.ok) {
+          await c.env.DB.prepare('UPDATE alerts SET status=?, sent_at=? WHERE id=?').bind('sent', Date.now(), alertId).run()
+        } else {
+          await c.env.DB.prepare('UPDATE alerts SET status=? WHERE id=?').bind('failed', alertId).run()
+        }
+      } catch {
+        await c.env.DB.prepare('UPDATE alerts SET status=? WHERE id=?').bind('failed', alertId).run()
+      }
+    }
+    // Discord
+    if (c.env.DISCORD_WEBHOOK_URL) {
+      const did = body.id + ':dc'
+      await c.env.DB.prepare('INSERT OR IGNORE INTO alerts (id, signal_id, channel, payload, status, retries) VALUES (?, ?, ?, ?, ?, 0)')
+        .bind(did, body.id, 'discord', jsonStr({ content: text }), 'queued').run()
+      try {
+        const dcRes = await fetch(c.env.DISCORD_WEBHOOK_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: text }) })
+        if (dcRes.ok) {
+          await c.env.DB.prepare('UPDATE alerts SET status=?, sent_at=? WHERE id=?').bind('sent', Date.now(), did).run()
+        } else {
+          await c.env.DB.prepare('UPDATE alerts SET status=? WHERE id=?').bind('failed', did).run()
+        }
+      } catch {
+        await c.env.DB.prepare('UPDATE alerts SET status=? WHERE id=?').bind('failed', did).run()
+      }
+    }
+  }
+
   return c.json({ ok: true, changes: res.meta.changes })
+})
+
+// GET /api/stats
+app.get('/api/stats', async (c) => {
+  const platform = c.req.query('platform')
+  const where = platform ? 'WHERE platform=?' : ''
+  const params = platform ? [platform] : []
+  const totalRow = await c.env.DB.prepare(`SELECT COUNT(*) as n FROM signals ${where}`).bind(...params as any).first<{ n: number }>()
+  const byClass = await c.env.DB.prepare(`SELECT predicted_class as class, COUNT(*) as n FROM signals ${where} GROUP BY predicted_class`).bind(...params as any).all<{ class: string; n: number }>()
+  const last = await c.env.DB.prepare(`SELECT timestamp FROM signals ${where} ORDER BY timestamp DESC LIMIT 1`).bind(...params as any).first<{ timestamp: number }>()
+  return c.json({ total: totalRow?.n || 0, byClass: byClass.results || [], lastTs: last?.timestamp || null })
 })
 
 // GET /api/signals/latest
@@ -127,6 +203,7 @@ app.get('/api/signals/:id', async (c) => {
 
 // GET /api/signals/stream (SSE minimal via text/event-stream)
 app.get('/api/signals/stream', async (c) => {
+  const platform = c.req.query('platform')
   const { readable, writable } = new TransformStream()
   const encoder = new TextEncoder()
   c.header('Content-Type', 'text/event-stream')
@@ -135,7 +212,9 @@ app.get('/api/signals/stream', async (c) => {
 
   // Simple poll loop (demo). In prod, use Durable Objects or queues.
   const interval = setInterval(async () => {
-    const { results } = await c.env.DB.prepare('SELECT * FROM signals ORDER BY timestamp DESC LIMIT 1').all()
+    const sql = `SELECT * FROM signals ${platform ? 'WHERE platform=?' : ''} ORDER BY timestamp DESC LIMIT 1`
+    const stmt = platform ? c.env.DB.prepare(sql).bind(platform) : c.env.DB.prepare(sql)
+    const { results } = await stmt.all()
     if (results && results[0]) {
       const data = `data: ${JSON.stringify(results[0])}\n\n`
       await writable.getWriter().write(encoder.encode(data))
@@ -170,6 +249,12 @@ app.post('/api/alerts/test', async (c) => {
     sent.discord = dcRes.status
   }
   return c.json({ ok: true, sent })
+})
+
+// GET /api/platforms
+app.get('/api/platforms', async (c) => {
+  const { results } = await c.env.DB.prepare('SELECT DISTINCT platform FROM signals ORDER BY platform').all<{ platform: string }>()
+  return c.json({ items: (results || []).map((r) => r.platform) })
 })
 
 app.get('/', (c) => {
